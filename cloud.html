@@ -105,7 +105,14 @@
            color: var(--mut); font-size: 13px; }
 
   /* file cards */
-  .card { padding: 14px; margin-bottom: 12px; animation: rise .5s ease both; transition: transform .2s; }
+  .card { position: relative; padding: 14px; margin-bottom: 12px; animation: rise .5s ease both; transition: transform .2s, box-shadow .2s;
+          -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  .card.sel { border-color: var(--b); box-shadow: 0 0 0 2px var(--b), 0 8px 32px rgba(0,0,0,.35); }
+  .card.sel .name { padding-right: 32px; }
+  .card.sel::after { content: "✓"; position: absolute; top: 10px; right: 12px; width: 24px; height: 24px; border-radius: 50%;
+          background: linear-gradient(135deg, var(--a), var(--b)); display: grid; place-items: center; font-size: 14px; font-weight: 700; }
+  .sbtns { display: flex; gap: 8px; }
+  .btn.sm { padding: 6px 12px; font-size: 12px; }
   .card:hover { transform: translateY(-2px); }
   .top { display: flex; gap: 12px; align-items: center; }
   .fi { width: 46px; height: 46px; flex: none; border-radius: 14px; display: grid; place-items: center; font-size: 24px;
@@ -167,7 +174,13 @@
     <div class="track" id="uptrack"><div class="fill" id="upfill"></div></div>
   </div>
 
-  <div class="stats"><span id="count"></span><button class="btn ghost" id="refresh" style="padding:6px 12px;font-size:12px">↻ Refresh</button></div>
+  <div class="stats"><span id="count"></span>
+    <div class="sbtns">
+      <button class="btn ghost sm" id="clear">✕ Clear</button>
+      <button class="btn ghost sm" id="selall" style="display:none">☑ Select all</button>
+      <button class="btn ghost sm" id="refresh">↻ Refresh</button>
+    </div>
+  </div>
   <div id="list"></div>
 </div>
 
@@ -227,15 +240,49 @@ async function load() {
   }
 }
 
+let ITEMS = [], countText = "", suppress = false;
+const selected = new Set();
+
+function syncSel() {
+  const on = selected.size > 0;
+  $("#refresh").style.display = on ? "none" : "";
+  $("#selall").style.display = on ? "" : "none";
+  $("#selall").textContent = selected.size === ITEMS.length ? "☐ Deselect all" : "☑ Select all";
+  $("#count").textContent = on ? selected.size + " selected" : countText;
+  document.querySelectorAll("#list .card").forEach(c => c.classList.toggle("sel", selected.has(+c.dataset.id)));
+}
+function toggleSel(id) { selected.has(id) ? selected.delete(id) : selected.add(id); syncSel(); }
+$("#selall").onclick = () => {
+  if (selected.size === ITEMS.length) selected.clear(); else ITEMS.forEach(f => selected.add(f.id));
+  syncSel();
+};
+
 function render(items) {
   const box = $("#list"); box.textContent = "";
   const total = items.reduce((a, f) => a + f.size, 0);
-  $("#count").textContent = items.length ? `${items.length} files · ${fmt(total)}` : "";
-  if (!items.length) { box.innerHTML = '<div class="glass empty">☁️<br>No files yet. Upload your first one!</div>'; return; }
+  ITEMS = items; selected.clear();
+  countText = items.length ? `${items.length} files · ${fmt(total)}` : "";
+  if (!items.length) { box.innerHTML = '<div class="glass empty">☁️<br>No files yet. Upload your first one!</div>'; syncSel(); return; }
 
   items.forEach((f, i) => {
     const c = document.createElement("div");
-    c.className = "glass card"; c.style.animationDelay = Math.min(i * 60, 500) + "ms";
+    c.className = "glass card"; c.style.animationDelay = Math.min(i * 60, 500) + "ms"; c.dataset.id = f.id;
+
+    // long press = start selecting
+    let timer, sx = 0, sy = 0;
+    c.addEventListener("pointerdown", e => {
+      suppress = false;
+      if (e.target.closest("button")) return;
+      sx = e.clientX; sy = e.clientY;
+      timer = setTimeout(() => { suppress = true; toggleSel(f.id); if (navigator.vibrate) navigator.vibrate(30); }, 500);
+    });
+    c.addEventListener("pointermove", e => { if (Math.hypot(e.clientX - sx, e.clientY - sy) > 12) clearTimeout(timer); });
+    ["pointerup", "pointerleave", "pointercancel"].forEach(ev => c.addEventListener(ev, () => clearTimeout(timer)));
+    c.addEventListener("contextmenu", e => e.preventDefault());
+    c.addEventListener("click", e => {
+      if (suppress) { suppress = false; return; }
+      if (selected.size && !e.target.closest("button")) toggleSel(f.id);
+    });
 
     const top = document.createElement("div"); top.className = "top";
     const fi = document.createElement("div"); fi.className = "fi"; fi.textContent = icon(f.mime);
@@ -256,6 +303,7 @@ function render(items) {
 
     c.append(top, dl, acts); box.append(c);
   });
+  syncSel();
 }
 
 async function remove(f) {
@@ -313,6 +361,7 @@ async function download(f, box, btn) {
 }
 
 /* ---------- upload with progress ---------- */
+let curXhr = null, cancelled = false;
 const picked = () => [...$("#file").files];
 $("#file").onchange = () => {
   $("#picked").textContent = picked().map(f => f.name + " (" + fmt(f.size) + ")").join(", ");
@@ -326,6 +375,7 @@ function uploadOne(file, i, total) {
   return new Promise(res => {
     const fd = new FormData(); fd.append("k", K); fd.append("file", file);
     const x = new XMLHttpRequest();
+    curXhr = x;
     const track = $("#uptrack"), fill = $("#upfill");
     $("#upname").textContent = `(${i}/${total}) ${file.name}`;
     track.classList.remove("wait", "done"); fill.style.width = "0%"; $("#uppct").textContent = "0%";
@@ -338,6 +388,7 @@ function uploadOne(file, i, total) {
     x.upload.onload = () => { track.classList.add("wait"); $("#uppct").textContent = "Saving to Telegram…"; };
     x.onload = () => { track.classList.remove("wait"); res(x.status === 200); };
     x.onerror = () => res(false);
+    x.onabort = () => res(false);
     x.send(fd);
   });
 }
@@ -346,9 +397,11 @@ $("#up").onclick = async () => {
   const files = picked();
   if (!files.length) return toast("Choose a file first");
   if (!K && !askPass()) return;
+  cancelled = false;
   const prog = $("#uprog"); prog.classList.add("on"); $("#up").disabled = true;
   for (let i = 0; i < files.length; i++) {
     const ok = await uploadOne(files[i], i + 1, files.length);
+    if (cancelled) return;
     if (!ok) { toast("Upload failed: " + files[i].name); $("#up").disabled = false; prog.classList.remove("on"); return; }
   }
   $("#uptrack").classList.add("done"); $("#upfill").style.width = "100%"; $("#uppct").textContent = "Done ✓";
@@ -359,6 +412,15 @@ $("#up").onclick = async () => {
 };
 
 $("#refresh").onclick = load;
+
+// Clear = reset the upload area on this page only. Files already in Telegram are NOT touched.
+$("#clear").onclick = () => {
+  cancelled = true;
+  if (curXhr) { curXhr.abort(); curXhr = null; }
+  $("#file").value = ""; $("#picked").textContent = "";
+  $("#uprog").classList.remove("on"); $("#up").disabled = false;
+  toast("Cleared");
+};
 load();
 </script>
 </body>
