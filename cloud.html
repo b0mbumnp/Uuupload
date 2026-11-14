@@ -393,17 +393,108 @@ function uploadOne(file, i, total) {
   });
 }
 
+/* ---------- background upload (keeps going if you minimize or close the app) ---------- */
+let curBg = null, wl = null;
+const swPromise = ("serviceWorker" in navigator && location.protocol === "https:")
+  ? navigator.serviceWorker.register("/sw.js").then(() => navigator.serviceWorker.ready).catch(() => null)
+  : Promise.resolve(null);
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", e => {
+    const m = e.data || {};
+    if (m.type !== "bg-done") return;
+    if (curBg && m.id === curBg.id) finishBg(m.ok); else load();
+  });
+}
+
+function finishBg(ok) {
+  if (!curBg) return;
+  curBg = null;
+  const track = $("#uptrack"); track.classList.remove("wait");
+  if (ok) {
+    track.classList.add("done"); $("#upfill").style.width = "100%"; $("#uppct").textContent = "Done ✓";
+    toast("Upload complete 🎉");
+    $("#file").value = ""; $("#picked").textContent = "";
+  } else {
+    toast("Upload failed. Check password and channel.");
+  }
+  $("#up").disabled = false;
+  setTimeout(() => $("#uprog").classList.remove("on"), 2500);
+  load();
+}
+
+function watchBg(bg, label) {
+  curBg = bg;
+  const track = $("#uptrack"), fill = $("#upfill");
+  $("#uprog").classList.add("on"); $("#up").disabled = true;
+  $("#upname").textContent = label;
+  track.classList.remove("wait", "done");
+  const tick = () => {
+    const tot = bg.uploadTotal || 0;
+    if (tot) {
+      const p = Math.min(100, bg.uploaded / tot * 100);
+      fill.style.width = p + "%";
+      if (bg.uploaded >= tot) { track.classList.add("wait"); $("#uppct").textContent = "Saving to Telegram…"; }
+      else $("#uppct").textContent = Math.round(p) + "%";
+    }
+    if (bg.result === "failure") finishBg(false);
+  };
+  bg.addEventListener("progress", tick); tick();
+}
+
+async function bgUpload(files) {
+  const reg = await swPromise;
+  if (!reg || !reg.backgroundFetch) return false;
+  try {
+    const reqs = files.map(f => {
+      const fd = new FormData(); fd.append("k", K); fd.append("file", f);
+      return new Request(`${API}/api/upload`, { method: "POST", body: fd, mode: "cors" });
+    });
+    const bg = await reg.backgroundFetch.fetch("up-" + Date.now(), reqs, {
+      title: `Uploading ${files.length} file${files.length > 1 ? "s" : ""} to My Cloud`
+    });
+    watchBg(bg, files.length > 1 ? `${files.length} files (background)` : files[0].name + " (background)");
+    return true;
+  } catch (e) {
+    return false;           // not supported or refused: use the normal upload below
+  }
+}
+
+// if you closed the app and came back while an upload is still running, show it again
+swPromise.then(async reg => {
+  if (!reg || !reg.backgroundFetch) return;
+  try {
+    for (const id of await reg.backgroundFetch.getIds()) {
+      const bg = await reg.backgroundFetch.get(id);
+      if (bg && !bg.result) watchBg(bg, "Upload running in background");
+    }
+  } catch (e) {}
+});
+
+/* normal upload fallback: keep screen awake so the phone does not pause it */
+async function keepAwake() { try { wl = await navigator.wakeLock.request("screen"); } catch (e) {} }
+function letSleep() { try { wl && wl.release(); } catch (e) {} wl = null; }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && $("#up").disabled && !curBg) keepAwake(); });
+
 $("#up").onclick = async () => {
   const files = picked();
   if (!files.length) return toast("Choose a file first");
   if (!K && !askPass()) return;
   cancelled = false;
   const prog = $("#uprog"); prog.classList.add("on"); $("#up").disabled = true;
+
+  // 1) best option: browser background upload
+  if (await bgUpload(files)) { toast("Uploading in background. You can minimize or close the app."); return; }
+
+  // 2) fallback: normal upload, page must stay open
+  toast("Keep this page open until the upload finishes");
+  keepAwake();
   for (let i = 0; i < files.length; i++) {
     const ok = await uploadOne(files[i], i + 1, files.length);
-    if (cancelled) return;
-    if (!ok) { toast("Upload failed: " + files[i].name); $("#up").disabled = false; prog.classList.remove("on"); return; }
+    if (cancelled) { letSleep(); return; }
+    if (!ok) { letSleep(); toast("Upload failed: " + files[i].name); $("#up").disabled = false; prog.classList.remove("on"); return; }
   }
+  letSleep();
   $("#uptrack").classList.add("done"); $("#upfill").style.width = "100%"; $("#uppct").textContent = "Done ✓";
   toast("Upload complete 🎉");
   $("#file").value = ""; $("#picked").textContent = ""; $("#up").disabled = false;
@@ -417,6 +508,8 @@ $("#refresh").onclick = load;
 $("#clear").onclick = () => {
   cancelled = true;
   if (curXhr) { curXhr.abort(); curXhr = null; }
+  if (curBg) { try { curBg.abort(); } catch (e) {} curBg = null; }
+  letSleep();
   $("#file").value = ""; $("#picked").textContent = "";
   $("#uprog").classList.remove("on"); $("#up").disabled = false;
   toast("Cleared");
