@@ -1,4 +1,4 @@
-import asyncio, json, os, re, secrets, shutil, tempfile
+import asyncio, json, os, re, secrets, shutil, tempfile, time
 from urllib.parse import quote
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
@@ -17,15 +17,73 @@ _ch = os.environ.get("CHANNEL", "")       # paste a link, @username, or id
 CHANNEL = None
 CHANNEL_ERR = ""
 
+# Comma-separated list of sites allowed to call this API, e.g. "https://mysite.com,https://my-new-app.onrender.com"
+# Leave ALLOWED_ORIGINS unset to allow any site (fine while testing).
+_origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = [o.strip() for o in _origins.split(",") if o.strip()] or ["*"]
+
+# Hide interactive API docs unless DEBUG=1 is set in Render's Environment.
+DEBUG = os.environ.get("DEBUG") == "1"
+
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-app = FastAPI()
+app = FastAPI(
+    docs_url="/docs" if DEBUG else None,
+    redoc_url="/redoc" if DEBUG else None,
+    openapi_url="/openapi.json" if DEBUG else None,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    if request.url.path == "/" or request.url.path.endswith(".html"):
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "media-src 'self' blob:; connect-src *; frame-ancestors 'none'"
+        )
+    return resp
+
+
+# ---- simple brute-force guard on the password ----
+_fails = {}            # ip -> (count, locked_until)
+MAX_FAILS, LOCK_SECONDS = 8, 300
+
+
+def _ip(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+def guard(request: Request):
+    ip = _ip(request)
+    count, until = _fails.get(ip, (0, 0))
+    if time.time() < until:
+        raise HTTPException(429, "Too many wrong attempts. Try again in a few minutes.")
+
+
+def guard_fail(request: Request):
+    ip = _ip(request)
+    count, _ = _fails.get(ip, (0, 0))
+    count += 1
+    until = time.time() + LOCK_SECONDS if count >= MAX_FAILS else 0
+    _fails[ip] = (count, until)
+
+
+def guard_ok(request: Request):
+    _fails.pop(_ip(request), None)
 
 CHUNK = 512 * 1024
 pending = {}
@@ -122,9 +180,20 @@ async def start():
         CHANNEL_ERR = "not logged in: SESSION is empty or not valid, open /setup to log in"
 
 
-def check(k: str):
+def check(k: str, request: Request = None):
+    if request:
+        guard(request)
     if not secrets.compare_digest(k or "", PASSWORD):
+        if request:
+            guard_fail(request)
         raise HTTPException(401, "Wrong password")
+    if request:
+        guard_ok(request)
+
+
+@app.get("/robots.txt")
+async def robots():
+    return HTMLResponse("User-agent: *\nDisallow: /", media_type="text/plain")
 
 
 @app.get("/sw.js")
@@ -173,8 +242,8 @@ async def setup_page():
 
 
 @app.post("/setup/phone")
-async def setup_phone(phone: str = Form(...), k: str = Form("")):
-    check(k)
+async def setup_phone(request: Request, phone: str = Form(...), k: str = Form("")):
+    check(k, request)
     r = await client.send_code_request(phone)
     pending["phone"] = phone
     pending["hash"] = r.phone_code_hash
@@ -182,8 +251,8 @@ async def setup_phone(phone: str = Form(...), k: str = Form("")):
 
 
 @app.post("/setup/code")
-async def setup_code(code: str = Form(...), pw: str = Form(""), k: str = Form("")):
-    check(k)
+async def setup_code(request: Request, code: str = Form(...), pw: str = Form(""), k: str = Form("")):
+    check(k, request)
     try:
         await client.sign_in(pending["phone"], code, phone_code_hash=pending["hash"])
     except SessionPasswordNeededError:
@@ -195,8 +264,8 @@ async def setup_code(code: str = Form(...), pw: str = Form(""), k: str = Form(""
 
 # ---------- files ----------
 @app.get("/api/files")
-async def files(k: str = ""):
-    check(k)
+async def files(request: Request, k: str = ""):
+    check(k, request)
     out = []
     async for m in client.iter_messages(ch(), limit=500):
         f = m.file
@@ -213,14 +282,14 @@ async def files(k: str = ""):
 
 
 @app.get("/api/state")
-async def state_get(k: str = ""):
-    check(k)
+async def state_get(request: Request, k: str = ""):
+    check(k, request)
     return await get_state()
 
 
 @app.post("/api/state")
 async def state_set(request: Request, k: str = ""):
-    check(k)
+    check(k, request)
     d = await request.json()
     st = {"hidden": sorted({int(x) for x in d.get("hidden", [])}),
           "gone": sorted({int(x) for x in d.get("gone", [])})}
@@ -229,8 +298,8 @@ async def state_set(request: Request, k: str = ""):
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...), k: str = Form("")):
-    check(k)
+async def upload(request: Request, file: UploadFile = File(...), k: str = Form("")):
+    check(k, request)
     name = re.sub(r"[^\w.\- ]", "_", file.filename or "file")
     d = tempfile.mkdtemp()
     path = os.path.join(d, name)
@@ -249,15 +318,15 @@ async def upload(file: UploadFile = File(...), k: str = Form("")):
 
 
 @app.delete("/api/files/{mid}")
-async def delete(mid: int, k: str = ""):
-    check(k)
+async def delete(request: Request, mid: int, k: str = ""):
+    check(k, request)
     await client.delete_messages(ch(), [mid])
     return {"ok": True}
 
 
 @app.get("/api/stream/{mid}")
 async def stream(mid: int, request: Request, k: str = "", dl: int = 0):
-    check(k)
+    check(k, request)
     msg = await client.get_messages(ch(), ids=mid)
     if not msg or not msg.file:
         raise HTTPException(404, "Not found")
