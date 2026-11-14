@@ -212,6 +212,13 @@ async function load() {
   try {
     const r = await fetch(`${API}/api/files?k=${q()}`);
     if (r.status === 401) { localStorage.removeItem("k"); K = ""; toast("Wrong password"); return load(); }
+    if (!r.ok) {
+      let t = "";
+      try { t = (await r.json()).detail; } catch (e) { t = "HTTP " + r.status; }
+      const b = $("#list"); b.innerHTML = '<div class="glass empty"></div>';
+      b.firstChild.textContent = "Server problem: " + (t || r.status);
+      return;
+    }
     const d = await r.json();
     localStorage.setItem("k", K);
     render(d);
