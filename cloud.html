@@ -235,6 +235,11 @@ async function load() {
     }
     const d = await r.json();
     localStorage.setItem("k", K);
+    await savePromise;                         // let a just-made Clear finish saving first
+    try {
+      const sr = await fetch(`${API}/api/state?k=${q()}`);
+      if (sr.ok) { const s = await sr.json(); hidden = new Set(s.hidden); gone = new Set(s.gone); }
+    } catch (e) {}
     render(d);
   } catch (e) {
     $("#list").innerHTML = '<div class="glass empty">Could not reach the server. Tap Refresh in a moment.</div>';
@@ -242,9 +247,17 @@ async function load() {
 }
 
 let ITEMS = [], lastAll = [], hiddenN = 0, countText = "", suppress = false;
-let hidden = new Set();
-try { hidden = new Set(JSON.parse(localStorage.getItem("hidden") || "[]")); } catch (e) {}
-const saveHidden = () => { try { localStorage.setItem("hidden", JSON.stringify([...hidden])); } catch (e) {} };
+// hidden = cleared, can be brought back with Restore.  gone = cleared twice, no Restore any more.
+// The lists live on the server (inside your Telegram channel), so they follow you to any phone or browser.
+let hidden = new Set(), gone = new Set();
+let savePromise = Promise.resolve();
+const saveHidden = () => {
+  const body = JSON.stringify({ hidden: [...hidden], gone: [...gone] });
+  savePromise = savePromise.then(async () => {
+    const r = await fetch(`${API}/api/state?k=${q()}`, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!r.ok) throw 0;
+  }).catch(() => toast("Could not save the cleared list. Try again."));
+};
 const selected = new Set();
 
 function syncSel() {
@@ -264,8 +277,8 @@ $("#selall").onclick = () => {
 
 function render(all) {
   lastAll = all;
-  const items = all.filter(f => !hidden.has(f.id));
-  hiddenN = all.length - items.length;
+  const items = all.filter(f => !hidden.has(f.id) && !gone.has(f.id));
+  hiddenN = all.filter(f => hidden.has(f.id)).length;
   const box = $("#list"); box.textContent = "";
   const total = items.reduce((a, f) => a + f.size, 0);
   ITEMS = items; selected.clear();
@@ -273,7 +286,8 @@ function render(all) {
   if (hiddenN) countText += (countText ? " · " : "") + `${hiddenN} hidden`;
   if (!items.length) {
     box.innerHTML = '<div class="glass empty"></div>';
-    box.firstChild.textContent = hiddenN ? "Everything is cleared from this page. Tap Restore to show it again." : "No files yet. Upload your first one!";
+    box.firstChild.textContent = hiddenN ? "Everything is cleared from this page. Tap Restore to show it again."
+      : (gone.size ? "Nothing to show. Upload a new file!" : "No files yet. Upload your first one!");
     syncSel(); return;
   }
 
@@ -518,12 +532,17 @@ $("#up").onclick = async () => {
 $("#refresh").onclick = load;
 
 // Clear only hides things on THIS page. Nothing is deleted from Telegram, and running uploads keep going.
+// 1st Clear  -> hides (Restore button appears).   2nd Clear on an empty page -> Restore is removed for good.
 $("#clear").onclick = () => {
   if (selected.size) {                       // something selected: hide only those
     const n = selected.size;
     selected.forEach(id => hidden.add(id)); saveHidden();
     render(lastAll);
     toast(`${n} removed from this page. Still safe in Telegram`);
+  } else if (ITEMS.length === 0 && hiddenN > 0) {   // page already cleared: make it final
+    hidden.forEach(id => gone.add(id)); hidden.clear(); saveHidden();
+    render(lastAll);
+    toast("Cleared for good. Files are still in Telegram");
   } else {                                   // nothing selected: clear everything on the page
     ITEMS.forEach(f => hidden.add(f.id)); saveHidden();
     if (!curBg && $("#up").disabled === false) {   // also reset the upload area, unless an upload is running
