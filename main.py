@@ -1,4 +1,4 @@
-import asyncio, os, re, secrets, shutil, tempfile
+import asyncio, json, os, re, secrets, shutil, tempfile
 from urllib.parse import quote
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
@@ -30,6 +30,54 @@ app.add_middleware(
 CHUNK = 512 * 1024
 pending = {}
 upload_lock = asyncio.Lock()   # send one file to Telegram at a time
+
+# ---- "cleared on site" list, saved as a tiny file inside the channel so it survives restarts/devices ----
+STATE_CAP = "MYCLOUD_STATE"
+STATE_NAME = "mycloud_state.json"
+_state = None
+_state_ids = []
+state_lock = asyncio.Lock()
+
+
+async def get_state():
+    global _state, _state_ids
+    if _state is not None:
+        return _state
+    st, ids = {"hidden": [], "gone": []}, []
+    async for m in client.iter_messages(ch(), search=STATE_CAP, limit=20):
+        if m.file and m.file.name == STATE_NAME:
+            ids.append(m.id)
+            if len(ids) == 1:                      # newest one wins
+                try:
+                    raw = await client.download_media(m, file=bytes)
+                    d = json.loads(raw.decode())
+                    st = {"hidden": [int(x) for x in d.get("hidden", [])],
+                          "gone": [int(x) for x in d.get("gone", [])]}
+                except Exception:
+                    pass
+    _state, _state_ids = st, ids
+    return _state
+
+
+async def save_state(st):
+    global _state, _state_ids
+    await get_state()
+    async with state_lock:
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, STATE_NAME)
+        try:
+            with open(path, "w") as f:
+                json.dump(st, f)
+            new = await client.send_file(ch(), path, force_document=True, caption=STATE_CAP, silent=True)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        old = _state_ids
+        _state, _state_ids = st, [new.id]
+        if old:
+            try:
+                await client.delete_messages(ch(), old)
+            except Exception:
+                pass
 
 
 async def resolve_channel(raw: str):
@@ -152,7 +200,7 @@ async def files(k: str = ""):
     out = []
     async for m in client.iter_messages(ch(), limit=500):
         f = m.file
-        if not f:
+        if not f or f.name == STATE_NAME:
             continue
         out.append({
             "id": m.id,
@@ -162,6 +210,22 @@ async def files(k: str = ""):
             "date": m.date.isoformat(),
         })
     return out
+
+
+@app.get("/api/state")
+async def state_get(k: str = ""):
+    check(k)
+    return await get_state()
+
+
+@app.post("/api/state")
+async def state_set(request: Request, k: str = ""):
+    check(k)
+    d = await request.json()
+    st = {"hidden": sorted({int(x) for x in d.get("hidden", [])}),
+          "gone": sorted({int(x) for x in d.get("gone", [])})}
+    await save_state(st)
+    return {"ok": True}
 
 
 @app.post("/api/upload")
