@@ -1,4 +1,4 @@
-import os, re, secrets, shutil, tempfile
+import asyncio, os, re, secrets, shutil, tempfile
 from urllib.parse import quote
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
@@ -29,6 +29,7 @@ app.add_middleware(
 
 CHUNK = 512 * 1024
 pending = {}
+upload_lock = asyncio.Lock()   # send one file to Telegram at a time
 
 
 async def resolve_channel(raw: str):
@@ -76,6 +77,13 @@ async def start():
 def check(k: str):
     if not secrets.compare_digest(k or "", PASSWORD):
         raise HTTPException(401, "Wrong password")
+
+
+@app.get("/sw.js")
+async def service_worker():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sw.js")
+    return FileResponse(here, media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
 
 
 @app.get("/")
@@ -169,7 +177,8 @@ async def upload(file: UploadFile = File(...), k: str = Form("")):
                 if not b:
                     break
                 out.write(b)
-        msg = await client.send_file(ch(), path, force_document=True, caption=name)
+        async with upload_lock:
+            msg = await client.send_file(ch(), path, force_document=True, caption=name)
         return {"id": msg.id}
     finally:
         shutil.rmtree(d, ignore_errors=True)
