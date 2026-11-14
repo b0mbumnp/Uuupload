@@ -69,6 +69,8 @@ async def start():
             CHANNEL = await resolve_channel(_ch)
         except Exception as e:
             CHANNEL_ERR = str(e)
+    else:
+        CHANNEL_ERR = "not logged in: SESSION is empty or not valid, open /setup to log in"
 
 
 def check(k: str):
