@@ -3,17 +3,19 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ.get("SESSION", "")   # empty at first; fill after /setup
 PASSWORD = os.environ["PASSWORD"]         # your site password
-_ch = os.environ.get("CHANNEL", "")       # private channel id (-100...) or @username
-CHANNEL = int(_ch) if _ch.lstrip("-").isdigit() else _ch
+_ch = os.environ.get("CHANNEL", "")       # paste a link, @username, or id
+CHANNEL = None
+CHANNEL_ERR = ""
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 app = FastAPI()
@@ -29,11 +31,44 @@ CHUNK = 512 * 1024
 pending = {}
 
 
+async def resolve_channel(raw: str):
+    s = raw.strip()
+    if not s:
+        raise ValueError("CHANNEL is empty")
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    m = re.search(r"t\.me/c/(\d+)", s)
+    if m:
+        return int("-100" + m.group(1))
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w-]+)", s)
+    if m:
+        h = m.group(1)
+        info = await client(CheckChatInviteRequest(h))
+        if hasattr(info, "chat"):          # already a member
+            return info.chat
+        upd = await client(ImportChatInviteRequest(h))
+        return upd.chats[0]
+    m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})", s)
+    name = m.group(1) if m else s.lstrip("@")
+    return await client.get_entity(name)
+
+
+def ch():
+    if CHANNEL is None:
+        raise HTTPException(503, "Channel not set: " + (CHANNEL_ERR or "check CHANNEL"))
+    return CHANNEL
+
+
 @app.on_event("startup")
 async def start():
+    global CHANNEL, CHANNEL_ERR
     await client.connect()
     if await client.is_user_authorized():
         await client.get_dialogs()
+        try:
+            CHANNEL = await resolve_channel(_ch)
+        except Exception as e:
+            CHANNEL_ERR = str(e)
 
 
 def check(k: str):
@@ -43,6 +78,9 @@ def check(k: str):
 
 @app.get("/")
 async def home():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud.html")
+    if os.path.exists(here):
+        return FileResponse(here)
     return {"ok": True}
 
 
@@ -102,7 +140,7 @@ async def setup_code(code: str = Form(...), pw: str = Form(""), k: str = Form(""
 async def files(k: str = ""):
     check(k)
     out = []
-    async for m in client.iter_messages(CHANNEL, limit=500):
+    async for m in client.iter_messages(ch(), limit=500):
         f = m.file
         if not f:
             continue
@@ -129,7 +167,7 @@ async def upload(file: UploadFile = File(...), k: str = Form("")):
                 if not b:
                     break
                 out.write(b)
-        msg = await client.send_file(CHANNEL, path, force_document=True, caption=name)
+        msg = await client.send_file(ch(), path, force_document=True, caption=name)
         return {"id": msg.id}
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -138,14 +176,14 @@ async def upload(file: UploadFile = File(...), k: str = Form("")):
 @app.delete("/api/files/{mid}")
 async def delete(mid: int, k: str = ""):
     check(k)
-    await client.delete_messages(CHANNEL, [mid])
+    await client.delete_messages(ch(), [mid])
     return {"ok": True}
 
 
 @app.get("/api/stream/{mid}")
 async def stream(mid: int, request: Request, k: str = "", dl: int = 0):
     check(k)
-    msg = await client.get_messages(CHANNEL, ids=mid)
+    msg = await client.get_messages(ch(), ids=mid)
     if not msg or not msg.file:
         raise HTTPException(404, "Not found")
 
