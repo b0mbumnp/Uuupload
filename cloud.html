@@ -111,7 +111,7 @@
   .card.sel .name { padding-right: 32px; }
   .card.sel::after { content: "✓"; position: absolute; top: 10px; right: 12px; width: 24px; height: 24px; border-radius: 50%;
           background: linear-gradient(135deg, var(--a), var(--b)); display: grid; place-items: center; font-size: 14px; font-weight: 700; }
-  .sbtns { display: flex; gap: 8px; }
+  .sbtns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   .btn.sm { padding: 6px 12px; font-size: 12px; }
   .card:hover { transform: translateY(-2px); }
   .top { display: flex; gap: 12px; align-items: center; }
@@ -176,6 +176,7 @@
 
   <div class="stats"><span id="count"></span>
     <div class="sbtns">
+      <button class="btn ghost sm" id="restore" style="display:none">↺ Restore</button>
       <button class="btn ghost sm" id="clear">✕ Clear</button>
       <button class="btn ghost sm" id="selall" style="display:none">☑ Select all</button>
       <button class="btn ghost sm" id="refresh">↻ Refresh</button>
@@ -240,13 +241,17 @@ async function load() {
   }
 }
 
-let ITEMS = [], countText = "", suppress = false;
+let ITEMS = [], lastAll = [], hiddenN = 0, countText = "", suppress = false;
+let hidden = new Set();
+try { hidden = new Set(JSON.parse(localStorage.getItem("hidden") || "[]")); } catch (e) {}
+const saveHidden = () => { try { localStorage.setItem("hidden", JSON.stringify([...hidden])); } catch (e) {} };
 const selected = new Set();
 
 function syncSel() {
   const on = selected.size > 0;
   $("#refresh").style.display = on ? "none" : "";
   $("#selall").style.display = on ? "" : "none";
+  $("#restore").style.display = (!on && hiddenN > 0) ? "" : "none";
   $("#selall").textContent = selected.size === ITEMS.length ? "☐ Deselect all" : "☑ Select all";
   $("#count").textContent = on ? selected.size + " selected" : countText;
   document.querySelectorAll("#list .card").forEach(c => c.classList.toggle("sel", selected.has(+c.dataset.id)));
@@ -257,12 +262,20 @@ $("#selall").onclick = () => {
   syncSel();
 };
 
-function render(items) {
+function render(all) {
+  lastAll = all;
+  const items = all.filter(f => !hidden.has(f.id));
+  hiddenN = all.length - items.length;
   const box = $("#list"); box.textContent = "";
   const total = items.reduce((a, f) => a + f.size, 0);
   ITEMS = items; selected.clear();
   countText = items.length ? `${items.length} files · ${fmt(total)}` : "";
-  if (!items.length) { box.innerHTML = '<div class="glass empty">☁️<br>No files yet. Upload your first one!</div>'; syncSel(); return; }
+  if (hiddenN) countText += (countText ? " · " : "") + `${hiddenN} hidden`;
+  if (!items.length) {
+    box.innerHTML = '<div class="glass empty"></div>';
+    box.firstChild.textContent = hiddenN ? "Everything is cleared from this page. Tap Restore to show it again." : "No files yet. Upload your first one!";
+    syncSel(); return;
+  }
 
   items.forEach((f, i) => {
     const c = document.createElement("div");
@@ -504,16 +517,24 @@ $("#up").onclick = async () => {
 
 $("#refresh").onclick = load;
 
-// Clear = reset the upload area on this page only. Files already in Telegram are NOT touched.
+// Clear only hides things on THIS page. Nothing is deleted from Telegram, and running uploads keep going.
 $("#clear").onclick = () => {
-  cancelled = true;
-  if (curXhr) { curXhr.abort(); curXhr = null; }
-  if (curBg) { try { curBg.abort(); } catch (e) {} curBg = null; }
-  letSleep();
-  $("#file").value = ""; $("#picked").textContent = "";
-  $("#uprog").classList.remove("on"); $("#up").disabled = false;
-  toast("Cleared");
+  if (selected.size) {                       // something selected: hide only those
+    const n = selected.size;
+    selected.forEach(id => hidden.add(id)); saveHidden();
+    render(lastAll);
+    toast(`${n} removed from this page. Still safe in Telegram`);
+  } else {                                   // nothing selected: clear everything on the page
+    ITEMS.forEach(f => hidden.add(f.id)); saveHidden();
+    if (!curBg && $("#up").disabled === false) {   // also reset the upload area, unless an upload is running
+      $("#file").value = ""; $("#picked").textContent = "";
+      $("#uprog").classList.remove("on");
+    }
+    render(lastAll);
+    toast("Cleared from this page. Files are still in Telegram");
+  }
 };
+$("#restore").onclick = () => { hidden.clear(); saveHidden(); render(lastAll); toast("Restored"); };
 load();
 </script>
 </body>
