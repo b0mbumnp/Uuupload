@@ -150,6 +150,26 @@
            opacity: 0; padding: 11px 18px; z-index: 30; font-size: 13px; transition: .35s; pointer-events: none; max-width: 90%; }
   .toast.on { opacity: 1; transform: translate(-50%, 0); }
 
+  /* password modal */
+  #pwmodal { position: fixed; inset: 0; z-index: 40; display: none; align-items: center; justify-content: center;
+             padding: 20px; background: rgba(5,5,18,.78); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+  #pwmodal.on { display: flex; animation: fade .25s ease both; }
+  .pwcard { width: 100%; max-width: 360px; padding: 28px 24px; text-align: center; animation: pwpop .35s cubic-bezier(.2,1.4,.4,1) both; }
+  @keyframes pwpop { from { opacity: 0; transform: scale(.85) translateY(10px); } to { opacity: 1; transform: none; } }
+  .pwico { font-size: 40px; margin-bottom: 6px; animation: bob 3s ease-in-out infinite; }
+  .pwcard h2 { margin: 4px 0 4px; font-size: 20px; }
+  .pwcard p { color: var(--mut); font-size: 13px; margin: 0 0 18px; }
+  .pwfield { position: relative; margin-bottom: 8px; }
+  .pwfield input { width: 100%; padding: 13px 44px 13px 14px; border-radius: 12px; font-size: 16px;
+                   background: rgba(255,255,255,.08); border: 1.5px solid var(--border); color: var(--fg);
+                   outline: none; transition: border-color .2s, box-shadow .2s; }
+  .pwfield input:focus { border-color: var(--b); box-shadow: 0 0 0 3px rgba(34,211,238,.25); }
+  .pwfield input.shake { animation: shake .4s; border-color: #ff5c7a; }
+  @keyframes shake { 20%,60% { transform: translateX(-6px); } 40%,80% { transform: translateX(6px); } }
+  #pweye { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: 0;
+           color: var(--mut); font-size: 17px; padding: 6px 8px; cursor: pointer; }
+  #pwerr { min-height: 18px; color: #ff8aa8; font-size: 12.5px; margin-bottom: 6px; }
+
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -191,6 +211,20 @@
   <div class="glass mbar"><span id="mname"></span><button class="btn ghost" id="close">✕ Close</button></div>
   <div class="glass" id="view"></div>
 </div>
+
+<div id="pwmodal">
+  <div class="glass pwcard">
+    <div class="pwico">🔒</div>
+    <h2>Enter password</h2>
+    <p>This cloud is private. Unlock it to continue.</p>
+    <div class="pwfield">
+      <input id="pwinput" type="password" autocomplete="current-password" placeholder="Password" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <button type="button" id="pweye">👁</button>
+    </div>
+    <div id="pwerr"></div>
+    <button class="btn full" id="pwgo">Unlock</button>
+  </div>
+</div>
 <div class="glass toast" id="toast"></div>
 
 <script>
@@ -219,15 +253,39 @@ function toast(t) {
   const e = $("#toast"); e.textContent = t; e.classList.add("on");
   clearTimeout(tt); tt = setTimeout(() => e.classList.remove("on"), 2600);
 }
-function askPass() { K = prompt("Password") || ""; return K; }
+/* ---------- password modal (replaces the plain browser prompt) ---------- */
+let pwResolve = null;
+function askPass(errMsg) {
+  return new Promise(resolve => {
+    pwResolve = resolve;
+    const input = $("#pwinput"), err = $("#pwerr");
+    err.textContent = errMsg || "";
+    input.value = ""; input.classList.remove("shake");
+    $("#pwmodal").classList.add("on");
+    setTimeout(() => input.focus(), 50);
+    if (errMsg) { input.classList.add("shake"); setTimeout(() => input.classList.remove("shake"), 400); }
+  });
+}
+function closePwModal() { $("#pwmodal").classList.remove("on"); pwResolve = null; }
+$("#pwgo").onclick = () => {
+  const v = $("#pwinput").value;
+  if (!v) { $("#pwinput").classList.add("shake"); setTimeout(() => $("#pwinput").classList.remove("shake"), 400); return; }
+  K = v; closePwModal(); if (pwResolve) pwResolve(v);
+};
+$("#pwinput").addEventListener("keydown", e => { if (e.key === "Enter") $("#pwgo").click(); });
+$("#pweye").onclick = () => {
+  const i = $("#pwinput"); i.type = i.type === "password" ? "text" : "password";
+  $("#pweye").textContent = i.type === "password" ? "👁" : "🙈";
+};
 
 /* ---------- list ---------- */
 async function load() {
-  if (!K && !askPass()) return;
+  if (!K) { const v = await askPass(); if (!v) return; }
   $("#list").innerHTML = '<div class="glass empty"><div class="spin"></div>Loading… the server may take ~30s to wake up</div>';
   try {
     const r = await fetch(`${API}/api/files?k=${q()}`);
-    if (r.status === 401) { localStorage.removeItem("k"); K = ""; toast("Wrong password"); return load(); }
+    if (r.status === 401) { localStorage.removeItem("k"); K = ""; const v = await askPass("Wrong password"); if (!v) return; return load(); }
+    if (r.status === 429) { let t=""; try{t=(await r.json()).detail;}catch(e){} toast(t || "Too many attempts, wait a bit"); return; }
     if (!r.ok) {
       let t = "";
       try { t = (await r.json()).detail; } catch (e) { t = "HTTP " + r.status; }
@@ -508,7 +566,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 $("#up").onclick = async () => {
   const files = picked();
   if (!files.length) return toast("Choose a file first");
-  if (!K && !askPass()) return;
+  if (!K) { const v = await askPass(); if (!v) return; }
   cancelled = false;
   const prog = $("#uprog"); prog.classList.add("on"); $("#up").disabled = true;
 
